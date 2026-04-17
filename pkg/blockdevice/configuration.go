@@ -21,13 +21,21 @@ func NewBlockDeviceFromConfiguration(configuration *pb.Configuration, mayZeroIni
 	switch source := configuration.Source.(type) {
 	case *pb.Configuration_DevicePath:
 		var err error
-		blockDevice, sectorSizeBytes, sectorCount, err = NewBlockDeviceFromDevice(source.DevicePath)
+		if configuration.DirectIo {
+			blockDevice, sectorSizeBytes, sectorCount, err = newBlockDeviceFromDeviceDirect(source.DevicePath)
+		} else {
+			blockDevice, sectorSizeBytes, sectorCount, err = NewBlockDeviceFromDevice(source.DevicePath)
+		}
 		if err != nil {
 			return nil, 0, 0, err
 		}
 	case *pb.Configuration_File:
 		var err error
-		blockDevice, sectorSizeBytes, sectorCount, err = NewBlockDeviceFromFile(source.File.Path, int(source.File.SizeBytes), mayZeroInitialize)
+		if configuration.DirectIo {
+			blockDevice, sectorSizeBytes, sectorCount, err = newBlockDeviceFromFileDirect(source.File.Path, int(source.File.SizeBytes), mayZeroInitialize)
+		} else {
+			blockDevice, sectorSizeBytes, sectorCount, err = NewBlockDeviceFromFile(source.File.Path, int(source.File.SizeBytes), mayZeroInitialize)
+		}
 		if err != nil {
 			return nil, 0, 0, err
 		}

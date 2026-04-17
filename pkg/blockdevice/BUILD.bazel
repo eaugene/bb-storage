@@ -5,8 +5,12 @@ go_library(
     srcs = [
         "block_device.go",
         "configuration.go",
+        "direct_io_block_device_linux.go",
+        "direct_io_disabled.go",
+        "direct_io_enabled.go",
         "memory_mapped_block_device_unix.go",
         "memory_mapped_block_device_windows.go",
+        "new_block_device_from_device_direct_linux.go",
         "new_block_device_from_device_disabled.go",
         "new_block_device_from_device_freebsd.go",
         "new_block_device_from_device_linux.go",

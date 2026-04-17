@@ -39,4 +39,20 @@ message Configuration {
   // this process to crash, due to the Go runtime being unable to create
   // any more threads.
   int64 write_concurrency_limit = 3;
+
+  // If set to true, use direct I/O (O_DIRECT) with pread/pwrite
+  // instead of memory-mapped I/O for accessing the block device.
+  //
+  // Memory-mapped I/O causes the kernel to cache block device pages in
+  // the page cache, which is attributed to the container's cgroup
+  // memory limit. For large block devices this can consume 100+ GiB of
+  // page cache, competing with the application heap for memory and
+  // potentially causing OOM kills.
+  //
+  // Direct I/O bypasses the page cache entirely, trading slightly
+  // higher per-read latency (syscall overhead) for predictable memory
+  // usage. All I/O buffers must be aligned to the device sector size.
+  //
+  // This option is only supported on Linux.
+  bool direct_io = 4;
 }

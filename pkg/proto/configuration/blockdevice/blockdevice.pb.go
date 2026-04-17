@@ -81,6 +81,7 @@ type Configuration struct {
 	//	*Configuration_File
 	Source                isConfiguration_Source `protobuf_oneof:"source"`
 	WriteConcurrencyLimit int64                  `protobuf:"varint,3,opt,name=write_concurrency_limit,json=writeConcurrencyLimit,proto3" json:"write_concurrency_limit,omitempty"`
+	DirectIo              bool                   `protobuf:"varint,4,opt,name=direct_io,json=directIo,proto3" json:"direct_io,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -147,6 +148,13 @@ func (x *Configuration) GetWriteConcurrencyLimit() int64 {
 	return 0
 }
 
+func (x *Configuration) GetDirectIo() bool {
+	if x != nil {
+		return x.DirectIo
+	}
+	return false
+}
+
 type isConfiguration_Source interface {
 	isConfiguration_Source()
 }
@@ -171,12 +179,13 @@ const file_github_com_buildbarn_bb_storage_pkg_proto_configuration_blockdevice_b
 	"\x11FileConfiguration\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"\xc2\x01\n" +
+	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"\xdf\x01\n" +
 	"\rConfiguration\x12!\n" +
 	"\vdevice_path\x18\x01 \x01(\tH\x00R\n" +
 	"devicePath\x12L\n" +
 	"\x04file\x18\x02 \x01(\v26.buildbarn.configuration.blockdevice.FileConfigurationH\x00R\x04file\x126\n" +
-	"\x17write_concurrency_limit\x18\x03 \x01(\x03R\x15writeConcurrencyLimitB\b\n" +
+	"\x17write_concurrency_limit\x18\x03 \x01(\x03R\x15writeConcurrencyLimit\x12\x1b\n" +
+	"\tdirect_io\x18\x04 \x01(\bR\bdirectIoB\b\n" +
 	"\x06sourceBEZCgithub.com/buildbarn/bb-storage/pkg/proto/configuration/blockdeviceb\x06proto3"
 
 var (
