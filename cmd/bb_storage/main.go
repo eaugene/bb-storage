@@ -191,7 +191,8 @@ func main() {
 						grpcservers.NewByteStreamServer(
 							contentAddressableStorage,
 							1<<16,
-							zstdPool))
+							zstdPool,
+							configuration.MaxConcurrentWrites))
 				}
 				if actionCache != nil {
 					remoteexecution.RegisterActionCacheServer(

@@ -12,25 +12,37 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/util"
 	bb_zstd "github.com/buildbarn/bb-storage/pkg/zstd"
 
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 type byteStreamServer struct {
-	blobAccess    blobstore.BlobAccess
-	readChunkSize int
-	zstdPool      bb_zstd.Pool
+	blobAccess     blobstore.BlobAccess
+	readChunkSize  int
+	zstdPool       bb_zstd.Pool
+	writeSemaphore *semaphore.Weighted
 }
 
 // NewByteStreamServer creates a GRPC service for reading blobs from and
 // writing blobs to a BlobAccess. It is used by Bazel to access the
 // Content Addressable Storage (CAS).
-func NewByteStreamServer(blobAccess blobstore.BlobAccess, readChunkSize int, zstdPool bb_zstd.Pool) bytestream.ByteStreamServer {
+//
+// maxConcurrentWrites limits the number of simultaneous ByteStream
+// Write operations. When set to 0 or negative, no limit is applied.
+// This prevents OOM kills caused by unbounded goroutine accumulation
+// when many large blobs are written concurrently.
+func NewByteStreamServer(blobAccess blobstore.BlobAccess, readChunkSize int, zstdPool bb_zstd.Pool, maxConcurrentWrites int64) bytestream.ByteStreamServer {
+	var ws *semaphore.Weighted
+	if maxConcurrentWrites > 0 {
+		ws = semaphore.NewWeighted(maxConcurrentWrites)
+	}
 	return &byteStreamServer{
-		blobAccess:    blobAccess,
-		readChunkSize: readChunkSize,
-		zstdPool:      zstdPool,
+		blobAccess:     blobAccess,
+		readChunkSize:  readChunkSize,
+		zstdPool:       zstdPool,
+		writeSemaphore: ws,
 	}
 }
 
@@ -131,6 +143,13 @@ func (r *byteStreamWriteServerChunkReader) Read() ([]byte, error) {
 func (byteStreamWriteServerChunkReader) Close() {}
 
 func (s *byteStreamServer) Write(stream bytestream.ByteStream_WriteServer) error {
+	if s.writeSemaphore != nil {
+		if err := util.AcquireSemaphore(stream.Context(), s.writeSemaphore, 1); err != nil {
+			return status.Error(codes.ResourceExhausted, "Too many concurrent write operations")
+		}
+		defer s.writeSemaphore.Release(1)
+	}
+
 	request, err := stream.Recv()
 	if err != nil {
 		if err == io.EOF {

@@ -109,6 +109,13 @@ message ApplicationConfiguration {
   // ByteStream server, and enables ZSTD compression for ByteStream
   // operations where the server supports it.
   buildbarn.configuration.zstd.PoolConfiguration zstd_pool = 21;
+
+  // Maximum number of concurrent ByteStream Write operations the
+  // storage server will process simultaneously. Excess requests block
+  // until a slot is available. This bounds peak memory usage from
+  // in-flight blob data, preventing OOM kills under heavy write load.
+  // When set to 0 (default), no limit is applied.
+  int64 max_concurrent_writes = 22;
 }
 
 // Storage configuration for backends which don't allow batch digest
