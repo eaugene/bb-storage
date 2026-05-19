@@ -58,6 +58,16 @@ type flatBlobAccess struct {
 	locationBlobMap LocationBlobMap
 	digestKeyFormat digest.KeyFormat
 
+	// lock protects OldCurrentNewLocationBlobMap state (block
+	// rotation and allocation counters) and coordinates with
+	// PeriodicSyncer's epoch boundaries. It is held exclusively for
+	// the brief Put/Refresh allocations that may rotate blocks, and
+	// in read mode for everything else — including the finalize
+	// step. Per-blob KeyLocationMap and PersistentBlockList
+	// invariants are now enforced inside those types themselves
+	// (hashingKeyLocationMap.mu and PersistentBlockList.mu), so
+	// multiple finalizes can run concurrently with each other and
+	// with Get readers under this outer RLock.
 	lock        *sync.RWMutex
 	refreshLock sync.Mutex
 
@@ -111,8 +121,12 @@ func (ba *flatBlobAccess) getKey(digest digest.Digest) Key {
 	return NewKeyFromString(digest.GetKey(ba.digestKeyFormat))
 }
 
-// finalizePut is called to finalize a write to the data store. This
-// method must be called while holding the write lock.
+// finalizePut commits a Put: it calls the BlockList's finalizer (which
+// records the offset and bumps PersistentBlockList epoch metadata
+// under PersistentBlockList.mu internally) and inserts the
+// key-location-map entry (under hashingKeyLocationMap.mu internally).
+// Callers hold ba.lock in read mode — the inner types provide their
+// own exclusion, so multiple finalizePut calls can run concurrently.
 func (ba *flatBlobAccess) finalizePut(putFinalizer LocationBlobPutFinalizer, key Key) (Location, error) {
 	location, err := putFinalizer()
 	if err != nil {
@@ -180,14 +194,14 @@ func (ba *flatBlobAccess) Get(ctx context.Context, blobDigest digest.Digest) buf
 	b1, b2 := b.CloneStream()
 	return b1.WithTask(func() error {
 		putFinalizer := putWriter(b2)
-		ba.lock.Lock()
+		ba.lock.RLock()
 		_, err := ba.finalizePut(putFinalizer, key)
 		if err == nil {
 			ba.refreshesBlobsGet.Observe(1)
 			ba.refreshesBlobsSizeGet.Observe(float64(location.SizeBytes))
 			ba.refreshesBlobsDurationGet.Observe(time.Since(refreshStart).Seconds())
 		}
-		ba.lock.Unlock()
+		ba.lock.RUnlock()
 		if err != nil {
 			return util.StatusWrap(err, "Failed to refresh blob")
 		}
@@ -285,14 +299,19 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 		sliceKeys = append(sliceKeys, ba.getKey(slice.Digest))
 	}
 
-	// Complete refreshing in case it was performed.
-	ba.lock.Lock()
+	// Complete refreshing in case it was performed, and insert the
+	// per-slice key-location entries. We hold ba.lock in read mode
+	// because hashingKeyLocationMap and PersistentBlockList enforce
+	// their own internal exclusion; we only need ba.lock here to
+	// keep block-state from being rotated out by a concurrent Put
+	// allocation (which takes ba.lock for writing).
+	ba.lock.RLock()
 	if needsRefresh {
 		parentLocation, err = ba.finalizePut(putFinalizer, parentKey)
 		// Add size metric before refresh
 		ba.refreshesBlbosSizeGetFromComposite.Observe(float64(parentLocation.SizeBytes))
 		if err != nil {
-			ba.lock.Unlock()
+			ba.lock.RUnlock()
 			bChild.Discard()
 			return buffer.NewBufferFromError(util.StatusWrap(err, "Failed to refresh blob"))
 		}
@@ -309,12 +328,12 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 			OffsetBytes: parentLocation.OffsetBytes + slice.OffsetBytes,
 			SizeBytes:   slice.SizeBytes,
 		}); err != nil {
-			ba.lock.Unlock()
+			ba.lock.RUnlock()
 			bChild.Discard()
 			return buffer.NewBufferFromError(util.StatusWrapf(err, "Failed to create child blob %#v", slice.Digest.String()))
 		}
 	}
-	ba.lock.Unlock()
+	ba.lock.RUnlock()
 	return bChild
 }
 
@@ -340,9 +359,9 @@ func (ba *flatBlobAccess) Put(ctx context.Context, blobDigest digest.Digest, b b
 	putFinalizer := putWriter(b)
 
 	key := ba.getKey(blobDigest)
-	ba.lock.Lock()
+	ba.lock.RLock()
 	_, err = ba.finalizePut(putFinalizer, key)
-	ba.lock.Unlock()
+	ba.lock.RUnlock()
 	return err
 }
 
@@ -397,48 +416,54 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 	// one thread.
 	ba.refreshLock.Lock()
 	defer ba.refreshLock.Unlock()
-	// Add refresh start time before the refresh loop
 	refreshStart := time.Now()
 	blobsRefreshedSuccessfully := 0
 	var blobRefreshSizeBytes int64
-	ba.lock.Lock()
+	// Re-acquire ba.lock per blob rather than holding it for the
+	// entire loop. The old behaviour pinned the outer lock across
+	// every iteration's klm.Get + locationBlobMap.Get + alloc,
+	// which during an old-to-new migration starved Get/Put on the
+	// outer lock. Per-iteration locking lets other operations
+	// interleave between refreshes.
 	for _, blobToRefresh := range blobsToRefresh {
-		if location, err := ba.keyLocationMap.Get(blobToRefresh.key); err == nil {
-			getter, needsRefresh := ba.locationBlobMap.Get(location)
-			if needsRefresh {
-				// Blob is present and still needs to be
-				// refreshed. Allocate space for a copy.
-				b := getter(blobToRefresh.digest)
-				blobRefreshSizeBytes += location.SizeBytes
-				putWriter, err := ba.locationBlobMap.Put(location.SizeBytes)
-				ba.lock.Unlock()
-				if err != nil {
-					b.Discard()
-					return digest.EmptySet, util.StatusWrapf(err, "Failed to refresh blob %#v", blobToRefresh.digest.String())
-				}
-
-				// Copy the data while unlocked, so that
-				// concurrent requests for other data
-				// continue to be serviced.
-				putFinalizer := putWriter(b)
-
-				ba.lock.Lock()
-				if _, err := ba.finalizePut(putFinalizer, blobToRefresh.key); err != nil {
-					ba.lock.Unlock()
-					return digest.EmptySet, util.StatusWrapf(err, "Failed to refresh blob %#v", blobToRefresh.digest.String())
-				}
-				blobsRefreshedSuccessfully++
-			}
-		} else if status.Code(err) == codes.NotFound {
-			// Blob disappeared between the first and second
-			// scan. Simply report it as missing.
-			missing.Add(blobToRefresh.digest)
-		} else {
+		ba.lock.Lock()
+		location, err := ba.keyLocationMap.Get(blobToRefresh.key)
+		if err != nil {
 			ba.lock.Unlock()
+			if status.Code(err) == codes.NotFound {
+				// Blob disappeared between the first and
+				// second scan. Simply report it as missing.
+				missing.Add(blobToRefresh.digest)
+				continue
+			}
 			return digest.EmptySet, util.StatusWrapf(err, "Failed to get blob %#v", blobToRefresh.digest.String())
 		}
+		getter, needsRefresh := ba.locationBlobMap.Get(location)
+		if !needsRefresh {
+			ba.lock.Unlock()
+			continue
+		}
+		b := getter(blobToRefresh.digest)
+		blobRefreshSizeBytes += location.SizeBytes
+		putWriter, err := ba.locationBlobMap.Put(location.SizeBytes)
+		ba.lock.Unlock()
+		if err != nil {
+			b.Discard()
+			return digest.EmptySet, util.StatusWrapf(err, "Failed to refresh blob %#v", blobToRefresh.digest.String())
+		}
+
+		// Copy the data while unlocked, so that concurrent
+		// requests for other data continue to be serviced.
+		putFinalizer := putWriter(b)
+
+		ba.lock.RLock()
+		_, finErr := ba.finalizePut(putFinalizer, blobToRefresh.key)
+		ba.lock.RUnlock()
+		if finErr != nil {
+			return digest.EmptySet, util.StatusWrapf(finErr, "Failed to refresh blob %#v", blobToRefresh.digest.String())
+		}
+		blobsRefreshedSuccessfully++
 	}
-	ba.lock.Unlock()
 	ba.refreshesBlobsFindMissing.Observe(float64(blobsRefreshedSuccessfully))
 	ba.refreshesBlobsDurationFindMissing.Observe(time.Since(refreshStart).Seconds())
 	ba.refreshesBlobsSizeFindMissing.Observe(float64(blobRefreshSizeBytes))
