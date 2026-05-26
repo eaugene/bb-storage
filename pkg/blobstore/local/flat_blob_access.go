@@ -17,6 +17,12 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// refreshStripeCount is the number of per-digest stripes used to
+// serialise refresh operations. Stripe index is the first byte of the
+// SHA-256 Key, which is uniformly distributed, so 256 stripes give a
+// 1:1 mapping with no hash function needed.
+const refreshStripeCount = 256
+
 var (
 	flatBlobAccessPrometheusMetrics sync.Once
 
@@ -68,8 +74,13 @@ type flatBlobAccess struct {
 	// (hashingKeyLocationMap.mu and PersistentBlockList.mu), so
 	// multiple finalizes can run concurrently with each other and
 	// with Get readers under this outer RLock.
-	lock        *sync.RWMutex
-	refreshLock sync.Mutex
+	lock *sync.RWMutex
+	// refreshStripes serialises refreshes per blob digest while
+	// letting refreshes of different digests run in parallel. The
+	// stripe index is the first byte of the SHA-256 key (uniform).
+	// Replaces the prior single refreshLock, which dedup'd at the
+	// cost of single-threading the entire refresh pipeline.
+	refreshStripes [refreshStripeCount]sync.Mutex
 
 	refreshesBlobsGet              prometheus.Observer
 	refreshesBlobsGetFromComposite prometheus.Observer
@@ -242,9 +253,12 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 	// The parent object was found, but it either hasn't been sliced
 	// yet, or it needs to be refreshed to ensure it doesn't
 	// disappear. Retry the process above, but now with write locks
-	// acquired.
-	ba.refreshLock.Lock()
-	defer ba.refreshLock.Unlock()
+	// acquired. The per-digest stripe lock serialises refreshes of
+	// the same parent across concurrent GetFromComposite calls; it
+	// does not block refreshes of other parents.
+	parentRefreshStripe := &ba.refreshStripes[parentKey[0]]
+	parentRefreshStripe.Lock()
+	defer parentRefreshStripe.Unlock()
 
 	ba.lock.Lock()
 	parentLocation, err = ba.keyLocationMap.Get(parentKey)
@@ -409,13 +423,13 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 
 	// One or more blobs need to be refreshed.
 	//
-	// We should prevent concurrent FindMissing() calls from
-	// refreshing the same blobs, as that would cause data to be
-	// duplicated and load to increase significantly. Pick up the
-	// refresh lock to ensure bandwidth of refreshing is limited to
-	// one thread.
-	ba.refreshLock.Lock()
-	defer ba.refreshLock.Unlock()
+	// Per-digest stripe locks serialise concurrent refreshes of the
+	// SAME blob (preserving the dedup property that the prior single
+	// refreshLock provided) while letting refreshes of DIFFERENT
+	// blobs run in parallel. Stripe index = key[0] (first byte of
+	// the SHA-256 Key). Up to 256 distinct digests can be in-flight
+	// concurrently; the old code limited refresh bandwidth to a
+	// single thread, which is now lifted.
 	refreshStart := time.Now()
 	blobsRefreshedSuccessfully := 0
 	var blobRefreshSizeBytes int64
@@ -426,43 +440,64 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 	// outer lock. Per-iteration locking lets other operations
 	// interleave between refreshes.
 	for _, blobToRefresh := range blobsToRefresh {
-		ba.lock.Lock()
-		location, err := ba.keyLocationMap.Get(blobToRefresh.key)
-		if err != nil {
-			ba.lock.Unlock()
-			if status.Code(err) == codes.NotFound {
-				// Blob disappeared between the first and
-				// second scan. Simply report it as missing.
-				missing.Add(blobToRefresh.digest)
-				continue
+		// refreshOne returns the per-blob outcome; using a closure
+		// gives us defer-based stripe unlock without leaking any
+		// exit path.
+		refreshed, sizeBytes, isMissing, err := func() (refreshed bool, sizeBytes int64, isMissing bool, err error) {
+			stripe := &ba.refreshStripes[blobToRefresh.key[0]]
+			stripe.Lock()
+			defer stripe.Unlock()
+
+			ba.lock.Lock()
+			location, lookupErr := ba.keyLocationMap.Get(blobToRefresh.key)
+			if lookupErr != nil {
+				ba.lock.Unlock()
+				if status.Code(lookupErr) == codes.NotFound {
+					// Blob disappeared between the first and
+					// second scan. Simply report it as missing.
+					return false, 0, true, nil
+				}
+				return false, 0, false, util.StatusWrapf(lookupErr, "Failed to get blob %#v", blobToRefresh.digest.String())
 			}
-			return digest.EmptySet, util.StatusWrapf(err, "Failed to get blob %#v", blobToRefresh.digest.String())
-		}
-		getter, needsRefresh := ba.locationBlobMap.Get(location)
-		if !needsRefresh {
+			getter, needsRefresh := ba.locationBlobMap.Get(location)
+			if !needsRefresh {
+				// Another concurrent refresh (same stripe) won the
+				// race and migrated the blob while we waited.
+				ba.lock.Unlock()
+				return false, 0, false, nil
+			}
+			b := getter(blobToRefresh.digest)
+			putWriter, allocErr := ba.locationBlobMap.Put(location.SizeBytes)
 			ba.lock.Unlock()
+			if allocErr != nil {
+				b.Discard()
+				return false, 0, false, util.StatusWrapf(allocErr, "Failed to refresh blob %#v", blobToRefresh.digest.String())
+			}
+
+			// Copy the data while unlocked, so that concurrent
+			// requests for other data continue to be serviced.
+			putFinalizer := putWriter(b)
+
+			ba.lock.RLock()
+			_, finErr := ba.finalizePut(putFinalizer, blobToRefresh.key)
+			ba.lock.RUnlock()
+			if finErr != nil {
+				return false, 0, false, util.StatusWrapf(finErr, "Failed to refresh blob %#v", blobToRefresh.digest.String())
+			}
+			return true, location.SizeBytes, false, nil
+		}()
+
+		if err != nil {
+			return digest.EmptySet, err
+		}
+		if isMissing {
+			missing.Add(blobToRefresh.digest)
 			continue
 		}
-		b := getter(blobToRefresh.digest)
-		blobRefreshSizeBytes += location.SizeBytes
-		putWriter, err := ba.locationBlobMap.Put(location.SizeBytes)
-		ba.lock.Unlock()
-		if err != nil {
-			b.Discard()
-			return digest.EmptySet, util.StatusWrapf(err, "Failed to refresh blob %#v", blobToRefresh.digest.String())
+		if refreshed {
+			blobsRefreshedSuccessfully++
+			blobRefreshSizeBytes += sizeBytes
 		}
-
-		// Copy the data while unlocked, so that concurrent
-		// requests for other data continue to be serviced.
-		putFinalizer := putWriter(b)
-
-		ba.lock.RLock()
-		_, finErr := ba.finalizePut(putFinalizer, blobToRefresh.key)
-		ba.lock.RUnlock()
-		if finErr != nil {
-			return digest.EmptySet, util.StatusWrapf(finErr, "Failed to refresh blob %#v", blobToRefresh.digest.String())
-		}
-		blobsRefreshedSuccessfully++
 	}
 	ba.refreshesBlobsFindMissing.Observe(float64(blobsRefreshedSuccessfully))
 	ba.refreshesBlobsDurationFindMissing.Observe(time.Since(refreshStart).Seconds())

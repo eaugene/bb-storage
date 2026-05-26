@@ -178,7 +178,7 @@ func TestFlatBlobAccessConcurrentMixedTraffic(t *testing.T) {
 					return
 				default:
 				}
-				b := digest.NewSetBuilder()
+				b := digest.NewSetBuilder(32)
 				for i := 0; i < 32; i++ {
 					b.Add(populated[rnd.IntN(len(populated))])
 				}
