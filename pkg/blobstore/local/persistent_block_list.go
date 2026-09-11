@@ -292,11 +292,21 @@ func (bl *PersistentBlockList) PushBack() error {
 
 // Get data from one of the blocks managed by this BlockList.
 //
-// Holds bl.mu in read mode for the full duration of the inner
-// block.Get call (not just the pointer load) so that a concurrent
-// PopFront → NotifyPersistentStateWritten cannot Release the block
-// while we're still reading from it. Callers no longer need to
-// guarantee that the surrounding ba.lock excludes block release.
+// bl.mu is held in read mode across both the bl.blocks[index] lookup
+// and the inner block.Get() call. Note that this does not cover the
+// data transfer: block.Get() returns a Buffer that may read lazily,
+// and BlockDeviceBackedBlockAllocator streams from the device long
+// after this function has returned and the read lock has been
+// dropped.
+//
+// What the read lock does cover is the window between resolving the
+// block and block.Get() taking its own reference on it. Blocks are
+// actually released in NotifyPersistentStateWritten, which takes
+// bl.mu exclusively and is therefore excluded here. Once block.Get()
+// has taken its reference, the Block's own refcount keeps the
+// underlying storage alive for as long as the returned Buffer is
+// open. Callers therefore no longer need the surrounding ba.lock to
+// exclude block release.
 func (bl *PersistentBlockList) Get(index int, digest digest.Digest, offsetBytes, sizeBytes int64, dataIntegrityCallback buffer.DataIntegrityCallback) buffer.Buffer {
 	bl.mu.RLock()
 	defer bl.mu.RUnlock()

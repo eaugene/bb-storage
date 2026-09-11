@@ -45,10 +45,10 @@ func makeDigest(seq uint64, sizeBytes int64) digest.Digest {
 // resolver + locationBlobMap.Get, and refresh paths triggered by old
 // blocks rotating out.
 //
-// Run as:
+// Run as (the go_test target sets race = "on"):
 //
-//	go test -race -run TestFlatBlobAccessConcurrentMixedTraffic -count=1 -v \
-//	    ./pkg/blobstore/local/concurrencytest/
+//	bazel test //pkg/blobstore/local/concurrencytest:concurrencytest_test \
+//	    --test_filter=TestFlatBlobAccessConcurrentMixedTraffic
 func TestFlatBlobAccessConcurrentMixedTraffic(t *testing.T) {
 	const (
 		blobSize       = 256

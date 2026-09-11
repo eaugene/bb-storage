@@ -16,10 +16,14 @@ import (
 // writtenOffsetBytes update races between two finalizers, both of
 // which trip the race detector under `go test -race`.
 //
-// Run as:
+// Run as (the go_test target sets race = "on"):
 //
-//	go test -race -run TestPersistentBlockListConcurrentFinalizeAndResolve \
-//	    ./pkg/blobstore/local/
+//	bazel test //pkg/blobstore/local/concurrencytest:concurrencytest_test \
+//	    --test_filter=TestPersistentBlockListConcurrentFinalizeAndResolve
+//
+// Plain `go test` does not work in this repository: pkg/digest requires a
+// protobuf symbol that bazel regenerates from .proto but that is absent
+// from the checked-in Go bindings of github.com/bazelbuild/remote-apis.
 func TestPersistentBlockListConcurrentFinalizeAndResolve(t *testing.T) {
 	const (
 		blockSize    = 1 << 20 // 1 MiB per block
