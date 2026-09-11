@@ -6,6 +6,7 @@ go_test(
         "flat_blob_access_concurrent_test.go",
         "persistent_block_list_concurrent_test.go",
         "refresh_stripe_dedup_test.go",
+        "volatile_block_list_concurrent_test.go",
     ],
     # These tests exist to be run under the race detector: they drive
     # concurrent traffic and assert almost nothing themselves, so without
