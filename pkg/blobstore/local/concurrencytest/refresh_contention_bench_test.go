@@ -59,9 +59,10 @@ import (
 )
 
 // benchCopyDelay models the cost of copying one blob out of an old
-// block and into a new one. Production reads on the affected cluster
-// were ~8.5ms; 100us keeps the benchmark fast while staying far above
-// scheduler noise, and the ratio between the trees is what matters.
+// block and into a new one. A disk-backed deployment pays single-digit
+// milliseconds here; 100us keeps the benchmark fast while staying far
+// above scheduler noise, and it is the ratio between configurations,
+// not the absolute number, that these benchmarks report on.
 const benchCopyDelay = 100 * time.Microsecond
 
 const benchBlobSizeBytes = 256
@@ -266,10 +267,10 @@ func BenchmarkFindMissingRefreshBatch(b *testing.B) {
 	}
 }
 
-// BenchmarkGetDuringRefresh measures the incident's actual symptom
-// rather than its mechanism: Get() latency while refresh traffic is in
-// flight. The 2026-09-04 page was a read-SLI collapse, so this is the
-// number that maps onto what the on-call saw.
+// BenchmarkGetDuringRefresh measures the symptom rather than the
+// mechanism: Get() latency while refresh traffic is in flight. Refresh
+// serialisation is only interesting because of what it does to the read
+// tail, so this is the number that maps onto what a client observes.
 func BenchmarkGetDuringRefresh(b *testing.B) {
 	for _, finders := range []int{0, 1, 4, 16} {
 		b.Run(fmt.Sprintf("finders=%d", finders), func(b *testing.B) {

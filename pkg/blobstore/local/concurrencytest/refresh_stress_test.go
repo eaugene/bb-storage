@@ -4,10 +4,10 @@ package concurrencytest_test
 // storage stack, as a counterpart to the stub-based microbenchmarks in
 // refresh_contention_bench_test.go.
 //
-// The stack assembled here is the production CAS shape:
+// The stack assembled here is the common CAS shape:
 //
 //	slowBlockAllocator (models a disk-backed device)
-//	  -> volatileBlockList        (prod: 'persistent' is unset)
+//	  -> volatileBlockList        (selected when 'persistent' is unset)
 //	    -> OldCurrentNewLocationBlobMap
 //	      -> hashingKeyLocationMap over an in-memory record array
 //	        -> FlatBlobAccess
