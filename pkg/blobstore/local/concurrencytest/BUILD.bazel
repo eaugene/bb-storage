@@ -1,0 +1,26 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+go_test(
+    name = "concurrencytest_test",
+    srcs = [
+        "flat_blob_access_concurrent_test.go",
+        "persistent_block_list_concurrent_test.go",
+        "refresh_concurrency_limit_test.go",
+        "refresh_stripe_dedup_test.go",
+        "volatile_block_list_concurrent_test.go",
+    ],
+    # These tests exist to be run under the race detector: they drive
+    # concurrent traffic and assert almost nothing themselves, so without
+    # -race they would pass even if the internal synchronisation added to
+    # PersistentBlockList and hashingKeyLocationMap were reverted.
+    race = "on",
+    deps = [
+        "//pkg/blobstore/buffer",
+        "//pkg/blobstore/local",
+        "//pkg/capabilities",
+        "//pkg/digest",
+        "@bazel_remote_apis//build/bazel/remote/execution/v2:remote_execution_go_proto",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
+    ],
+)
