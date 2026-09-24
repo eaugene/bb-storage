@@ -177,7 +177,10 @@ func TestFlatBlobAccessConcurrentMixedTrafficVolatile(t *testing.T) {
 	close(stop)
 	wg.Wait()
 
-	if puts.Load() == 0 || gets.Load()+getsMissing.Load() == 0 || finds.Load() == 0 {
+	// gets must be non-zero on its own: getsMissing counts FAILED reads,
+	// so a guard on the sum would accept a run in which every read
+	// errored and the read path was never really exercised.
+	if puts.Load() == 0 || gets.Load() == 0 || finds.Load() == 0 {
 		t.Errorf("workload did not exercise all paths: puts=%d gets=%d gets_missing=%d finds=%d",
 			puts.Load(), gets.Load(), getsMissing.Load(), finds.Load())
 	}

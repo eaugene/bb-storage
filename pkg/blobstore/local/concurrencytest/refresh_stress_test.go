@@ -14,8 +14,7 @@ package concurrencytest_test
 //
 // It reports Get and FindMissing tail latency under mixed traffic and
 // byte-verifies every successful read, so it is both a performance A/B
-// and a corruption check. It compiles against the baseline and the
-// fixed tree alike.
+// and a corruption check.
 //
 // Skipped unless BB_STRESS=1, so it does not slow `bazel test //...`:
 //

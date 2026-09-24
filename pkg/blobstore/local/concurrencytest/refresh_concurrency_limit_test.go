@@ -12,6 +12,9 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore/local"
 	"github.com/buildbarn/bb-storage/pkg/capabilities"
 	"github.com/buildbarn/bb-storage/pkg/digest"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // trackingLocationBlobMap is countingLocationBlobMap plus a record of
@@ -78,10 +81,9 @@ func (lbm *trackingLocationBlobMap) Put(sizeBytes int64) (local.LocationBlobPutW
 // semaphore the observed peak rises to the number of finders.
 func TestFindMissingRefreshConcurrencyLimit(t *testing.T) {
 	const (
-		finders           = 16
-		blobsPerFinder    = 8
-		blobSizeBytes     = 256
-		unlimitedByStripe = 0
+		finders        = 16
+		blobsPerFinder = 8
+		blobSizeBytes  = 256
 	)
 
 	for _, tc := range []struct {
@@ -179,15 +181,25 @@ func TestFindMissingRefreshConcurrencyLimit(t *testing.T) {
 }
 
 // TestRefreshConcurrencyRespectsContext asserts that a caller blocked
-// waiting for a refresh slot gives up when its context is cancelled,
-// rather than holding the stripe until a slot frees up.
+// waiting for a refresh slot fails with the context's error instead of
+// waiting out the queue ahead of it.
+//
+// Asserting only that the callers eventually return is not enough: with
+// a finite workload they return anyway once the queue drains, so such a
+// test passes with the cancellation handling deleted. The assertion
+// here is therefore on the returned error, with the queue sized so that
+// most callers are provably still waiting when cancel() fires.
 func TestRefreshConcurrencyRespectsContext(t *testing.T) {
 	const (
 		finders        = 8
-		blobsPerFinder = 4
+		blobsPerFinder = 64
 		blobSizeBytes  = 256
 	)
 
+	// At concurrency 1 the whole workload serialises into
+	// finders*blobsPerFinder*refreshCopyDelay = ~256ms, and cancel()
+	// fires about 20ms in, so the large majority of callers are still
+	// queued on the semaphore at that point.
 	keyLocationMap := &stubKeyLocationMap{m: map[local.Key]local.Location{}}
 	locationBlobMap := &trackingLocationBlobMap{}
 
@@ -217,31 +229,40 @@ func TestRefreshConcurrencyRespectsContext(t *testing.T) {
 		capabilities.NewStaticProvider(&remoteexecution.ServerCapabilities{}),
 	)
 
-	// With a single slot and a modelled copy delay, most of these
-	// finders are queued behind the slot when the context is
-	// cancelled. They must all return rather than block.
 	ctx, cancel := context.WithCancel(context.Background())
+	errs := make([]error, finders)
 	var wg sync.WaitGroup
 	for f := 0; f < finders; f++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			//nolint:errcheck // Either outcome is valid; the assertion is that it returns.
-			access.FindMissing(ctx, digestSets[id])
+			_, errs[id] = access.FindMissing(ctx, digestSets[id])
 		}(f)
 	}
-	time.Sleep(2 * refreshCopyDelay)
-	cancel()
 
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("FindMissing callers did not return after context cancellation; " +
-			"a caller is blocked on the refresh semaphore while holding a stripe")
+	// Cancel only once refresh is demonstrably under way, so the test
+	// is not racing the goroutines' start-up.
+	deadline := time.Now().Add(10 * time.Second)
+	for locationBlobMap.inFlight.Load() == 0 {
+		if time.Now().After(deadline) {
+			cancel()
+			wg.Wait()
+			t.Fatal("refresh never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	wg.Wait()
+
+	cancelled := 0
+	for _, err := range errs {
+		if status.Code(err) == codes.Canceled {
+			cancelled++
+		}
+	}
+	if cancelled == 0 {
+		t.Error("no FindMissing caller returned Canceled; a caller queued on the " +
+			"refresh semaphore is ignoring context cancellation")
 	}
 }

@@ -32,10 +32,12 @@ package concurrencytest_test
 //     TestFindMissingRefreshDedup originally passed with the stripe
 //     lock removed for precisely this reason.
 //
-// The file compiles against both the baseline and the fixed tree
-// (NewFlatBlobAccess's signature is unchanged), which is what makes an
-// A/B possible. See refresh_stress_test.go for the real-stack
-// counterpart.
+// NOTE: this file no longer compiles against the baseline tree --
+// NewFlatBlobAccess gained a refreshConcurrency parameter. The A/B is
+// now done in-tree instead, which is cleaner anyway: run with
+// refreshConcurrency 1 to get the old single-threaded refresh, and with
+// the default to get the striped one, against one binary. See
+// refresh_stress_test.go for the real-stack counterpart.
 
 import (
 	"context"
@@ -291,8 +293,6 @@ func BenchmarkGetDuringRefresh(b *testing.B) {
 				}(f)
 			}
 
-			readTarget := fresh
-
 			// Wait for refresh traffic to actually be in flight before
 			// timing. The framework's b.N=1 warm-up would otherwise
 			// finish before the finders have started, measuring an
@@ -311,7 +311,7 @@ func BenchmarkGetDuringRefresh(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				buf := access.Get(ctx, readTarget)
+				buf := access.Get(ctx, fresh)
 				if _, err := buf.ToByteSlice(benchBlobSizeBytes); err != nil {
 					b.StopTimer()
 					close(stop)
