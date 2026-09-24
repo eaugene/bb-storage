@@ -3,6 +3,7 @@ package concurrencytest_test
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/local"
@@ -10,11 +11,21 @@ import (
 
 // TestPersistentBlockListConcurrentFinalizeAndResolve drives many
 // concurrent BlockListPutFinalizer calls together with concurrent
-// BlockReferenceResolver reads. Without internal synchronisation in
-// PersistentBlockList, the finalizer's epochHashSeeds slice append
-// races with the resolver's slice read and the per-block
-// writtenOffsetBytes update races between two finalizers, both of
-// which trip the race detector under `go test -race`.
+// BlockReferenceResolver reads and a sync cycle. Without internal
+// synchronisation in PersistentBlockList this trips the race detector
+// two ways: the per-block writtenOffsetBytes update races between two
+// finalizers, and the finalizer's epochHashSeeds append races with the
+// resolver's read of the same slice.
+//
+// The sync goroutine is load-bearing, not decoration. The append branch
+// fires only when len(epochLastAbsoluteBlockIndex) == synchronizingEpochs
+// or the current epoch predates the written block. With a single block
+// and no sync cycle, neither is ever true again after the seed put, so
+// epochHashSeeds stays frozen at one element and the append/read race
+// never occurs -- the test would silently cover only half of what it
+// claims. NotifySyncStarting() republishes synchronizingEpochs, which
+// re-arms the first clause. The epoch-growth assertion at the bottom is
+// what stops that regressing.
 //
 // Run as (the go_test target sets race = "on"):
 //
@@ -53,9 +64,32 @@ func TestPersistentBlockListConcurrentFinalizeAndResolve(t *testing.T) {
 		}
 	}
 
+	epochsBefore := synchronizedEpochs(blockList)
+
+	// Syncer: models PeriodicSyncer's epoch boundaries, which is what
+	// makes finalizers take the epochHashSeeds append branch. Both
+	// calls take bl.mu exclusively, so this also exercises finalizers
+	// and resolver reads racing against the lifecycle methods.
+	syncerStop := make(chan struct{})
+	var syncerWg sync.WaitGroup
+	syncerWg.Add(1)
+	go func() {
+		defer syncerWg.Done()
+		for {
+			select {
+			case <-syncerStop:
+				return
+			default:
+			}
+			blockList.NotifySyncStarting(false)
+			blockList.NotifySyncCompleted()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
 	// Producers: take a slot, allocate, copy, finalize. Each
-	// producer races with peers on writtenOffsetBytes and may
-	// trigger the epochHashSeeds append branch.
+	// producer races with peers on writtenOffsetBytes and, thanks to
+	// the syncer above, genuinely reaches the epochHashSeeds append.
 	var producersWg sync.WaitGroup
 	for p := 0; p < producers; p++ {
 		producersWg.Add(1)
@@ -103,6 +137,28 @@ func TestPersistentBlockListConcurrentFinalizeAndResolve(t *testing.T) {
 	}
 
 	producersWg.Wait()
+	close(syncerStop)
+	syncerWg.Wait()
 	close(stop)
 	readersWg.Wait()
+
+	// Prove the append branch was actually reached. Without this the
+	// test can pass while covering only the writtenOffsetBytes race.
+	if epochsAfter := synchronizedEpochs(blockList); epochsAfter <= epochsBefore {
+		t.Errorf("synchronized epochs did not grow (%d -> %d): the finalizer never "+
+			"took the epochHashSeeds append branch, so the append/read race was "+
+			"never exercised", epochsBefore, epochsAfter)
+	}
+}
+
+// synchronizedEpochs counts the epochs PersistentBlockList considers
+// durable, which is how many times the finalizer has taken the
+// epochHashSeeds append branch and had it survive a sync cycle.
+func synchronizedEpochs(blockList *local.PersistentBlockList) int {
+	_, blocks := blockList.GetPersistentState()
+	n := 0
+	for _, b := range blocks {
+		n += len(b.EpochHashSeeds)
+	}
+	return n
 }
