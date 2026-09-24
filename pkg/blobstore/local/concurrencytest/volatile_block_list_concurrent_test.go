@@ -88,6 +88,7 @@ func TestFlatBlobAccessConcurrentMixedTrafficVolatile(t *testing.T) {
 		locationBlobMap,
 		digest.KeyWithoutInstance,
 		&globalLock,
+		0,
 		"volatiletest",
 		capabilities.NewStaticProvider(&remoteexecution.ServerCapabilities{}),
 	)

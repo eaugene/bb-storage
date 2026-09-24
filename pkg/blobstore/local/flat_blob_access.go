@@ -23,6 +23,17 @@ import (
 // 1:1 mapping with no hash function needed.
 const refreshStripeCount = 256
 
+// DefaultRefreshConcurrency is the number of refreshes of distinct
+// blobs that may run concurrently when no explicit limit is configured.
+//
+// The historical value was effectively 1: a single refreshLock
+// serialised every refresh in the process, which made refresh latency
+// scale with (concurrent callers x blobs per call x copy time) and
+// could stall the read path for seconds. Bounding concurrency at 64
+// removes that serialisation while still capping how much read and
+// write bandwidth refreshing may consume at once.
+const DefaultRefreshConcurrency = 64
+
 var (
 	flatBlobAccessPrometheusMetrics sync.Once
 
@@ -81,6 +92,12 @@ type flatBlobAccess struct {
 	// Replaces the prior single refreshLock, which dedup'd at the
 	// cost of single-threading the entire refresh pipeline.
 	refreshStripes [refreshStripeCount]sync.Mutex
+	// refreshSemaphore bounds how many refreshes of distinct blobs
+	// may be in flight at once, so that lifting the old
+	// single-threaded refresh limit does not let a refresh storm
+	// consume unbounded read and write bandwidth. A slot is always
+	// taken before ba.lock, never while holding it.
+	refreshSemaphore chan struct{}
 
 	refreshesBlobsGet              prometheus.Observer
 	refreshesBlobsGetFromComposite prometheus.Observer
@@ -100,20 +117,33 @@ type flatBlobAccess struct {
 // either ignores the REv2 instance name in digests entirely, or it
 // strongly partitions objects by instance name. It does not introduce
 // any hierarchy.
-func NewFlatBlobAccess(keyLocationMap KeyLocationMap, locationBlobMap LocationBlobMap, digestKeyFormat digest.KeyFormat, lock *sync.RWMutex, storageType string, capabilitiesProvider capabilities.Provider) blobstore.BlobAccess {
+//
+// refreshConcurrency bounds the number of refreshes of distinct blobs
+// that may run concurrently. Values <= 0 select
+// DefaultRefreshConcurrency; values above refreshStripeCount are
+// clamped to it, as refreshes are striped that many ways by digest.
+func NewFlatBlobAccess(keyLocationMap KeyLocationMap, locationBlobMap LocationBlobMap, digestKeyFormat digest.KeyFormat, lock *sync.RWMutex, refreshConcurrency int, storageType string, capabilitiesProvider capabilities.Provider) blobstore.BlobAccess {
 	flatBlobAccessPrometheusMetrics.Do(func() {
 		prometheus.MustRegister(flatBlobAccessRefreshesBlobs)
 		prometheus.MustRegister(flatBlobAccessRefreshesDurationSeconds)
 		prometheus.MustRegister(flatBlobAccessRefreshesSizeBytes)
 	})
 
+	if refreshConcurrency <= 0 {
+		refreshConcurrency = DefaultRefreshConcurrency
+	}
+	if refreshConcurrency > refreshStripeCount {
+		refreshConcurrency = refreshStripeCount
+	}
+
 	return &flatBlobAccess{
 		Provider: capabilitiesProvider,
 
-		keyLocationMap:  keyLocationMap,
-		locationBlobMap: locationBlobMap,
-		digestKeyFormat: digestKeyFormat,
-		lock:            lock,
+		keyLocationMap:   keyLocationMap,
+		locationBlobMap:  locationBlobMap,
+		digestKeyFormat:  digestKeyFormat,
+		lock:             lock,
+		refreshSemaphore: make(chan struct{}, refreshConcurrency),
 
 		refreshesBlobsGet:              flatBlobAccessRefreshesBlobs.WithLabelValues(storageType, "Get"),
 		refreshesBlobsGetFromComposite: flatBlobAccessRefreshesBlobs.WithLabelValues(storageType, "GetFromComposite"),
@@ -130,6 +160,23 @@ func NewFlatBlobAccess(keyLocationMap KeyLocationMap, locationBlobMap LocationBl
 
 func (ba *flatBlobAccess) getKey(digest digest.Digest) Key {
 	return NewKeyFromString(digest.GetKey(ba.digestKeyFormat))
+}
+
+// acquireRefreshSlot reserves one of the refresh concurrency slots,
+// blocking until one is free or ctx is done. The returned function
+// releases the slot.
+//
+// This must never be called while holding ba.lock. Slot holders need
+// ba.lock to make progress, so a caller that blocked here while holding
+// it would deadlock the refresh path. The established order is
+// stripe -> refreshSemaphore -> ba.lock -> klm.mu -> bl.mu.
+func (ba *flatBlobAccess) acquireRefreshSlot(ctx context.Context) (func(), error) {
+	select {
+	case ba.refreshSemaphore <- struct{}{}:
+		return func() { <-ba.refreshSemaphore }, nil
+	case <-ctx.Done():
+		return nil, util.StatusFromContext(ctx)
+	}
 }
 
 // finalizePut commits a Put: it calls the BlockList's finalizer (which
@@ -202,6 +249,14 @@ func (ba *flatBlobAccess) Get(ctx context.Context, blobDigest digest.Digest) buf
 
 	// Copy the object while it's been returned. Block until copying
 	// has finished to apply back-pressure.
+	//
+	// Unlike the FindMissing() and GetFromComposite() refresh paths,
+	// this one deliberately takes neither a refresh stripe nor a
+	// refreshSemaphore slot. It is inline with a client read, so
+	// queueing it behind other refreshes would reintroduce exactly
+	// the read-path stall this change exists to remove. This matches
+	// the upstream behaviour, where the single refreshLock was not
+	// held here either (see the TODO above).
 	b1, b2 := b.CloneStream()
 	return b1.WithTask(func() error {
 		putFinalizer := putWriter(b2)
@@ -259,6 +314,12 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 	parentRefreshStripe := &ba.refreshStripes[parentKey[0]]
 	parentRefreshStripe.Lock()
 	defer parentRefreshStripe.Unlock()
+
+	releaseRefreshSlot, err := ba.acquireRefreshSlot(ctx)
+	if err != nil {
+		return buffer.NewBufferFromError(err)
+	}
+	defer releaseRefreshSlot()
 
 	ba.lock.Lock()
 	parentLocation, err = ba.keyLocationMap.Get(parentKey)
@@ -427,9 +488,13 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 	// SAME blob (preserving the dedup property that the prior single
 	// refreshLock provided) while letting refreshes of DIFFERENT
 	// blobs run in parallel. Stripe index = key[0] (first byte of
-	// the SHA-256 Key). Up to 256 distinct digests can be in-flight
-	// concurrently; the old code limited refresh bandwidth to a
-	// single thread, which is now lifted.
+	// the SHA-256 Key).
+	//
+	// The old code also used that single lock to limit refresh
+	// bandwidth to one thread. That limit is preserved, but as an
+	// explicit and configurable one: refreshSemaphore caps how many
+	// refreshes of distinct blobs may be in flight, defaulting to
+	// DefaultRefreshConcurrency rather than to 1.
 	refreshStart := time.Now()
 	blobsRefreshedSuccessfully := 0
 	var blobRefreshSizeBytes int64
@@ -447,6 +512,12 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 			stripe := &ba.refreshStripes[blobToRefresh.key[0]]
 			stripe.Lock()
 			defer stripe.Unlock()
+
+			releaseSlot, err := ba.acquireRefreshSlot(ctx)
+			if err != nil {
+				return false, 0, false, err
+			}
+			defer releaseSlot()
 
 			ba.lock.Lock()
 			location, lookupErr := ba.keyLocationMap.Get(blobToRefresh.key)

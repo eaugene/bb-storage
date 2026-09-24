@@ -143,6 +143,7 @@ func TestFindMissingRefreshDedup(t *testing.T) {
 		locationBlobMap,
 		digest.KeyWithoutInstance,
 		&globalLock,
+		0,
 		"dedup",
 		capabilities.NewStaticProvider(&remoteexecution.ServerCapabilities{}),
 	)

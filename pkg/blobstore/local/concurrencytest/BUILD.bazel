@@ -5,6 +5,7 @@ go_test(
     srcs = [
         "flat_blob_access_concurrent_test.go",
         "persistent_block_list_concurrent_test.go",
+        "refresh_concurrency_limit_test.go",
         "refresh_stripe_dedup_test.go",
         "volatile_block_list_concurrent_test.go",
     ],
