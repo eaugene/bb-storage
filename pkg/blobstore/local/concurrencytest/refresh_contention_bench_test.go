@@ -188,7 +188,7 @@ func benchHarness(finders, batch int, copyDelay time.Duration) (blobstore.BlobAc
 
 	var globalLock sync.RWMutex
 	access := local.NewFlatBlobAccess(
-		klm, lbm, digest.KeyWithoutInstance, &globalLock, "bench",
+		klm, lbm, digest.KeyWithoutInstance, &globalLock, 0, "bench",
 		capabilities.NewStaticProvider(&remoteexecution.ServerCapabilities{}),
 	)
 	return access, sets, fresh, lbm

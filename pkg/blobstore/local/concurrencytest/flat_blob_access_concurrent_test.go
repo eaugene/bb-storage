@@ -96,6 +96,7 @@ func TestFlatBlobAccessConcurrentMixedTraffic(t *testing.T) {
 		locationBlobMap,
 		digest.KeyWithoutInstance,
 		&globalLock,
+		0,
 		"racetest",
 		capabilities.NewStaticProvider(&remoteexecution.ServerCapabilities{}),
 	)

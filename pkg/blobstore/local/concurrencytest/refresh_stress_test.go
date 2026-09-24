@@ -225,7 +225,7 @@ func TestRefreshStress(t *testing.T) {
 
 	var globalLock sync.RWMutex
 	access := local.NewFlatBlobAccess(
-		keyLocationMap, locationBlobMap, digest.KeyWithoutInstance, &globalLock, "stress",
+		keyLocationMap, locationBlobMap, digest.KeyWithoutInstance, &globalLock, 0, "stress",
 		capabilities.NewStaticProvider(&remoteexecution.ServerCapabilities{}),
 	)
 
